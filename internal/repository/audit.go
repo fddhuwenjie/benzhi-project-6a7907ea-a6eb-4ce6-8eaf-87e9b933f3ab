@@ -27,7 +27,7 @@ func (r *SQLiteRepository) AuditTimeline(ctx context.Context, batchID string) ([
 	cached, ok := r.auditCache[batchID]
 	r.auditMu.RUnlock()
 	if ok {
-		return cached, nil
+		return cloneEventRecords(cached), nil
 	}
 
 	rows, err := r.db.QueryContext(ctx, `SELECT sequence_no,event_type,actor_id,occurred_at,revision,payload,previous_digest,digest FROM audit_events WHERE batch_id=? ORDER BY sequence_no`, batchID)
@@ -65,7 +65,27 @@ func (r *SQLiteRepository) AuditTimeline(ctx context.Context, batchID string) ([
 	r.auditMu.Lock()
 	r.auditCache[batchID] = events
 	r.auditMu.Unlock()
-	return events, nil
+	return cloneEventRecords(events), nil
+}
+
+// cloneEventRecords returns an independent deep copy of the audit event slice
+// so that callers mutating the returned EventRecord fields or the Payload
+// backing byte slice cannot corrupt the cached records consumed by later
+// AuditTimeline or VerifyAudit calls.
+func cloneEventRecords(events []EventRecord) []EventRecord {
+	if len(events) == 0 {
+		return make([]EventRecord, 0)
+	}
+	clone := make([]EventRecord, len(events))
+	for i, e := range events {
+		clone[i] = e
+		if e.Payload != nil {
+			payload := make([]byte, len(e.Payload))
+			copy(payload, e.Payload)
+			clone[i].Payload = payload
+		}
+	}
+	return clone
 }
 
 func VerifyEvents(events []EventRecord) AuditVerification {
