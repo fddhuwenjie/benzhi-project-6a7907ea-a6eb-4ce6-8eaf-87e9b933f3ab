@@ -6,23 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"sync"
 	"time"
 
 	"timber-stage-qualifier/internal/domain"
 )
 
-type cachedPayload struct {
-	canonical []byte
-	digest    string
-}
-
-type Generator struct {
-	mu             sync.Mutex
-	cachedRevision int64
-	cachedPayload  cachedPayload
-	cacheReady     bool
-}
+type Generator struct{}
 
 func NewGenerator() *Generator { return &Generator{} }
 
@@ -35,19 +24,6 @@ func (g *Generator) Generate(batch *domain.TreatmentBatch, certificateID, eviden
 	}
 	if len(batch.Observations) == 0 {
 		return nil, domain.NewRuleError("missing_observations", "证书缺少观测范围")
-	}
-	g.mu.Lock()
-	cached, ok := g.cachedPayload, g.cacheReady && g.cachedRevision == batch.Revision
-	g.mu.Unlock()
-	if ok {
-		return &Certificate{
-			CertificateID:    certificateID,
-			BatchID:          batch.BatchID,
-			DocumentVersion:  DocumentVersion,
-			CanonicalPayload: append([]byte(nil), cached.canonical...),
-			PayloadSHA256:    cached.digest,
-			IssuedAt:         issuedAt.UTC(),
-		}, nil
 	}
 	observations := append([]domain.ProcessObservation(nil), batch.Observations...)
 	sort.Slice(observations, func(i, j int) bool { return observations[i].SequenceNo < observations[j].SequenceNo })
@@ -80,11 +56,6 @@ func (g *Generator) Generate(batch *domain.TreatmentBatch, certificateID, eviden
 	}
 	sum := sha256.Sum256(encoded)
 	digest := hex.EncodeToString(sum[:])
-	g.mu.Lock()
-	g.cachedRevision = batch.Revision
-	g.cachedPayload = cachedPayload{canonical: append([]byte(nil), encoded...), digest: digest}
-	g.cacheReady = true
-	g.mu.Unlock()
 	return &Certificate{CertificateID: certificateID, BatchID: batch.BatchID, DocumentVersion: DocumentVersion, CanonicalPayload: encoded, PayloadSHA256: digest, IssuedAt: issuedAt.UTC()}, nil
 }
 
