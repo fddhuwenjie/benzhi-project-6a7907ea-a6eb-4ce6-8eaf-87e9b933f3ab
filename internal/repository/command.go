@@ -19,15 +19,20 @@ type Creation func() (*domain.TreatmentBatch, any, EventInput, error)
 func (r *SQLiteRepository) Create(ctx context.Context, batchID, requestID, fingerprint string, expectedRevision int64, create Creation) (CommandResult, error) {
 	unlock := r.locks.lock(batchID)
 	defer unlock()
-	// BUG(seed): detach the transaction from the caller lifecycle. A canceled request
-	// can therefore continue through every SQL step and commit a state change.
-	operationCtx := context.WithoutCancel(ctx)
-	return r.execute(operationCtx, batchID, requestID, fingerprint, func(tx *sql.Tx) ([]byte, error) {
+	// Honor the caller's context lifecycle: a request that was canceled before
+	// or during the write must not persist any state. The context is propagated
+	// through every SQL step and re-checked right before commit so the returned
+	// error is recognizable via errors.Is(err, context.Canceled) and the
+	// transaction rolls back without leaving revisions or audit events.
+	if err := ctx.Err(); err != nil {
+		return CommandResult{}, err
+	}
+	return r.execute(ctx, batchID, requestID, fingerprint, func(tx *sql.Tx) ([]byte, error) {
 		if expectedRevision != 0 {
 			return nil, domain.ErrConflict
 		}
 		var exists int
-		if err := tx.QueryRowContext(operationCtx, `SELECT COUNT(*) FROM batches WHERE batch_id=?`, batchID).Scan(&exists); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM batches WHERE batch_id=?`, batchID).Scan(&exists); err != nil {
 			return nil, err
 		}
 		if exists != 0 {
@@ -38,10 +43,10 @@ func (r *SQLiteRepository) Create(ctx context.Context, batchID, requestID, finge
 			return nil, err
 		}
 		now := event.At.UTC()
-		if err := insertBatchTx(operationCtx, tx, batch, now); err != nil {
+		if err := insertBatchTx(ctx, tx, batch, now); err != nil {
 			return nil, err
 		}
-		if _, err := appendEventTx(operationCtx, tx, batch, event); err != nil {
+		if _, err := appendEventTx(ctx, tx, batch, event); err != nil {
 			return nil, err
 		}
 		return json.Marshal(response)
@@ -51,18 +56,23 @@ func (r *SQLiteRepository) Create(ctx context.Context, batchID, requestID, finge
 func (r *SQLiteRepository) Mutate(ctx context.Context, batchID, requestID, fingerprint string, expectedRevision int64, mutate Mutation) (CommandResult, error) {
 	unlock := r.locks.lock(batchID)
 	defer unlock()
-	// BUG(seed): use a context that cannot be canceled for the whole mutation.
-	// This lets a request that timed out still persist its domain transition.
-	operationCtx := context.WithoutCancel(ctx)
-	return r.execute(operationCtx, batchID, requestID, fingerprint, func(tx *sql.Tx) ([]byte, error) {
-		batch, err := loadBatchTx(operationCtx, tx, batchID)
+	// Honor the caller's context lifecycle: a request that was canceled before
+	// or during the mutation must not persist any state. The context is
+	// propagated through every SQL step and re-checked right before commit so
+	// the returned error is recognizable via errors.Is(err, context.Canceled)
+	// and the transaction rolls back without leaving revisions or audit events.
+	if err := ctx.Err(); err != nil {
+		return CommandResult{}, err
+	}
+	return r.execute(ctx, batchID, requestID, fingerprint, func(tx *sql.Tx) ([]byte, error) {
+		batch, err := loadBatchTx(ctx, tx, batchID)
 		if err != nil {
 			return nil, err
 		}
 		if batch.Revision != expectedRevision {
 			return nil, domain.ErrConflict
 		}
-		root, err := auditRootTx(operationCtx, tx, batchID)
+		root, err := auditRootTx(ctx, tx, batchID)
 		if err != nil {
 			return nil, err
 		}
@@ -70,16 +80,16 @@ func (r *SQLiteRepository) Mutate(ctx context.Context, batchID, requestID, finge
 		if err != nil {
 			return nil, err
 		}
-		if err := saveBatchTx(operationCtx, tx, batch, event.At); err != nil {
+		if err := saveBatchTx(ctx, tx, batch, event.At); err != nil {
 			return nil, err
 		}
-		newRoot, err := appendEventTx(operationCtx, tx, batch, event)
+		newRoot, err := appendEventTx(ctx, tx, batch, event)
 		if err != nil {
 			return nil, err
 		}
 		if certificate != nil {
 			certificate.AuditRootDigest = newRoot
-			if err := insertCertificateTx(operationCtx, tx, certificate); err != nil {
+			if err := insertCertificateTx(ctx, tx, certificate); err != nil {
 				return nil, err
 			}
 		}
@@ -110,6 +120,13 @@ func (r *SQLiteRepository) execute(ctx context.Context, batchID, requestID, fing
 	}
 	body, err = operation(tx)
 	if err != nil {
+		return CommandResult{}, err
+	}
+	// Re-check the caller context immediately before committing so a request
+	// canceled while the operation ran still surfaces a recognizable
+	// context.Canceled/context.DeadlineExceeded error instead of persisting
+	// partial state. The defer above rolls the transaction back on this path.
+	if err := ctx.Err(); err != nil {
 		return CommandResult{}, err
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO idempotency(request_id,batch_id,fingerprint,response_body,committed_at) VALUES(?,?,?,?,?)`, requestID, batchID, fingerprint, body, time.Now().UTC().Format(time.RFC3339Nano))
